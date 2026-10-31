@@ -1,0 +1,3 @@
+||www.youtube.com/watch?$document,1p,replace=/"adPlacements"/"no_ads"/g
+||www.youtube.com/watch?$document,1p,replace=/"adSlots"/"no_ads"/g
+||www.youtube.com/watch?$document,1p,replace=/"playerAds"/"no_ads"/g

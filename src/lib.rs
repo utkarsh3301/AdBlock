@@ -50,6 +50,7 @@ struct Request<'a> {
     source_host: String,
     third_party: bool,
     kind: RequestType,
+    tokens: Vec<u64>,
 }
 
 impl<'a> Request<'a> {
@@ -59,8 +60,48 @@ impl<'a> Request<'a> {
         let source_host = source_url[s..e].to_ascii_lowercase();
         let url_lower = url.to_ascii_lowercase();
         let third_party = base_domain(&url_lower[host.0..host.1]) != base_domain(&source_host);
-        Self { url, url_lower, host, source_host, third_party, kind }
+        let bytes = url_lower.as_bytes();
+        let mut tokens: Vec<u64> = token_spans(bytes).map(|(s, e)| hash(&bytes[s..e])).collect();
+        tokens.sort_unstable();
+        tokens.dedup();
+        tokens.push(0);
+        Self { url, url_lower, host, source_host, third_party, kind, tokens }
     }
+}
+
+// uBO list directives (!#if / !#else / !#endif).
+// ponytail: environment hardcoded to Firefox; make it a parameter if another front end appears
+const ENV: [&str; 3] = ["env_firefox", "cap_html_filtering", "cap_user_stylesheet"];
+
+fn condition(expr: &str) -> bool {
+    expr.split("||").any(|all| {
+        all.split("&&").all(|t| {
+            let t = t.trim().trim_matches(['(', ')']);
+            match t.strip_prefix('!') {
+                Some(t) => !ENV.contains(&t.trim()),
+                None => ENV.contains(&t),
+            }
+        })
+    })
+}
+
+fn active_lines(rules: &str) -> impl Iterator<Item = &str> {
+    let mut stack: Vec<bool> = vec![];
+    rules.lines().filter(move |line| {
+        let line = line.trim();
+        if let Some(expr) = line.strip_prefix("!#if ") {
+            stack.push(condition(expr));
+        } else if line.starts_with("!#else") {
+            if let Some(top) = stack.last_mut() {
+                *top = !*top;
+            }
+        } else if line.starts_with("!#endif") {
+            stack.pop();
+        } else {
+            return stack.iter().all(|&b| b);
+        }
+        false
+    })
 }
 
 // ponytail: ignores userinfo and IPv6 hosts, swap in a real URL parser if those show up
@@ -109,6 +150,24 @@ struct Filter {
     types: u16,
     domains: Vec<String>,
     not_domains: Vec<String>,
+    replace: Option<Replacement>,
+}
+
+pub struct Replacement {
+    pub find: String,
+    pub with: String,
+    pub all: bool,
+}
+
+// Only literal $replace=/find/with/ (optionally /g) is supported; real regex filters are dropped.
+fn parse_replace(spec: &str) -> Option<Replacement> {
+    let mut parts = spec.strip_prefix('/')?.split('/');
+    let (find, with, flags) = (parts.next()?, parts.next()?, parts.next()?);
+    let literal = !find.is_empty()
+        && !find.contains(['\\', '.', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|', '^', '$'])
+        && !with.contains(['\\', '$']);
+    (literal && parts.next().is_none() && matches!(flags, "" | "g"))
+        .then(|| Replacement { find: find.to_string(), with: with.to_string(), all: flags == "g" })
 }
 
 impl Filter {
@@ -153,7 +212,9 @@ impl Filter {
                 "important" => f.important = true,
                 "match-case" => f.match_case = true,
                 _ => {
-                    if let Some(list) = name.strip_prefix("domain=").or(name.strip_prefix("from=")) {
+                    if let Some(spec) = name.strip_prefix("replace=") {
+                        f.replace = Some(parse_replace(spec).filter(|_| !f.exception)?);
+                    } else if let Some(list) = name.strip_prefix("domain=").or(name.strip_prefix("from=")) {
                         for d in list.split('|') {
                             match d.strip_prefix('~') {
                                 Some(d) => f.not_domains.push(d.to_ascii_lowercase()),
@@ -249,7 +310,7 @@ fn hash(token: &[u8]) -> u64 {
 }
 
 // Filters are bucketed under their rarest token. A request only checks the buckets for tokens in its
-// URL, plus bucket 0 for filters with no usable token.
+// URL, plus bucket 0 (always last in Request::tokens) for filters with no usable token.
 struct Index {
     buckets: HashMap<u64, Vec<Filter>>,
 }
@@ -268,8 +329,12 @@ impl Index {
         Self { buckets }
     }
 
-    fn any(&self, tokens: &[u64], req: &Request) -> bool {
-        tokens.iter().chain(&[0]).filter_map(|t| self.buckets.get(t)).flatten().any(|f| f.matches(req))
+    fn matching<'s: 'r, 'r>(&'s self, req: &'r Request<'r>) -> impl Iterator<Item = &'s Filter> + 'r {
+        req.tokens.iter().filter_map(|t| self.buckets.get(t)).flatten().filter(|f| f.matches(req))
+    }
+
+    fn len(&self) -> usize {
+        self.buckets.values().map(Vec::len).sum()
     }
 }
 
@@ -321,6 +386,7 @@ pub struct Engine {
     important: Index,
     blocks: Index,
     exceptions: Index,
+    replacers: Index,
     generic: Vec<String>,
     generic_css: String,
     // ponytail: linear scan of domain-specific rules per page; index by hostname if it shows up in profiles
@@ -330,9 +396,9 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(rules: &str) -> Self {
-        let (mut important, mut blocks, mut exceptions) = (vec![], vec![], vec![]);
+        let (mut important, mut blocks, mut exceptions, mut replacers) = (vec![], vec![], vec![], vec![]);
         let (mut hide, mut unhide) = (vec![], vec![]);
-        for line in rules.lines() {
+        for line in active_lines(rules) {
             if let Some((exception, rule)) = Cosmetic::parse(line) {
                 if exception {
                     unhide.push(rule);
@@ -340,10 +406,11 @@ impl Engine {
                     hide.push(rule);
                 }
             } else if let Some(f) = Filter::parse(line) {
-                match (f.exception, f.important) {
-                    (true, _) => exceptions.push(f),
-                    (false, true) => important.push(f),
-                    (false, false) => blocks.push(f),
+                match (f.replace.is_some(), f.exception, f.important) {
+                    (true, _, _) => replacers.push(f),
+                    (_, true, _) => exceptions.push(f),
+                    (_, _, true) => important.push(f),
+                    _ => blocks.push(f),
                 }
             }
         }
@@ -359,6 +426,7 @@ impl Engine {
             important: Index::new(important),
             blocks: Index::new(blocks),
             exceptions: Index::new(exceptions),
+            replacers: Index::new(replacers),
             generic_css: hide_css(generic.iter().map(String::as_str)),
             generic,
             specific,
@@ -386,17 +454,19 @@ impl Engine {
     }
 
     pub fn filter_count(&self) -> usize {
-        [&self.important, &self.blocks, &self.exceptions].iter().flat_map(|i| i.buckets.values()).map(Vec::len).sum()
+        [&self.important, &self.blocks, &self.exceptions, &self.replacers].iter().map(|i| i.len()).sum()
     }
 
     pub fn should_block(&self, url: &str, source_url: &str, kind: RequestType) -> bool {
         let req = Request::new(url, source_url, kind);
-        let url = req.url_lower.as_bytes();
-        let mut tokens: Vec<u64> = token_spans(url).map(|(s, e)| hash(&url[s..e])).collect();
-        tokens.sort_unstable();
-        tokens.dedup();
-        self.important.any(&tokens, &req)
-            || (self.blocks.any(&tokens, &req) && !self.exceptions.any(&tokens, &req))
+        self.important.matching(&req).next().is_some()
+            || (self.blocks.matching(&req).next().is_some() && self.exceptions.matching(&req).next().is_none())
+    }
+
+    // Text replacements to apply to the response body of this request.
+    pub fn replacements(&self, url: &str, source_url: &str, kind: RequestType) -> Vec<&Replacement> {
+        let req = Request::new(url, source_url, kind);
+        self.replacers.matching(&req).filter_map(|f| f.replace.as_ref()).collect()
     }
 }
 
@@ -473,5 +543,37 @@ example.com##a{color:red}
         let ex = css("https://example.com/");
         assert!(!ex.contains("json-prune") && !ex.contains("abp-has") && !ex.contains("color"));
         assert!(!e.should_block("https://example.com/x", "https://a.com/", Script));
+    }
+
+    #[test]
+    fn replace_filters_and_directives() {
+        let e = Engine::new(
+            r#"
+!#if env_firefox
+||www.youtube.com/youtubei/v1/player?$xhr,1p,replace=/"adPlacements"/"no_ads"/
+!#else
+||chrome-only.com^
+!#endif
+!#if !cap_html_filtering
+||not-firefox.com^
+!#endif
+!#if env_mv3 || env_firefox && !env_mobile
+||firefox-desktop.com^
+!#endif
+||x.com/a$xhr,replace=/a.b/c/
+"#,
+        );
+        let player = "https://www.youtube.com/youtubei/v1/player?key=1";
+        let watch = "https://www.youtube.com/watch?v=1";
+        let reps = e.replacements(player, watch, Xhr);
+        assert!(reps.len() == 1 && reps[0].find == r#""adPlacements""# && reps[0].with == r#""no_ads""# && !reps[0].all);
+        assert!(e.replacements(player, watch, Script).is_empty());
+        assert!(e.replacements(player, "https://evil.com/", Xhr).is_empty());
+        assert!(!e.should_block(player, watch, Xhr));
+        assert!(e.replacements("https://x.com/a", "https://x.com/", Xhr).is_empty());
+
+        assert!(!e.should_block("https://chrome-only.com/", "https://a.com/", Script));
+        assert!(!e.should_block("https://not-firefox.com/", "https://a.com/", Script));
+        assert!(e.should_block("https://firefox-desktop.com/", "https://a.com/", Script));
     }
 }
