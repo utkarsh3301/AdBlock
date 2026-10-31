@@ -35,4 +35,10 @@ fn main() {
         elapsed,
         elapsed / urls.len() as u32
     );
+
+    for page in ["https://www.example.org/", "https://www.cnn.com/", "https://www.youtube.com/"] {
+        let t = Instant::now();
+        let css = engine.cosmetic_css(page);
+        println!("{page}: {} hide rules, {} KB of CSS in {:?}", css.lines().count(), css.len() / 1024, t.elapsed());
+    }
 }

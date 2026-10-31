@@ -48,3 +48,11 @@ pub unsafe extern "C" fn should_block(
     let kind = TYPES.get(kind).copied().unwrap_or(RequestType::Other);
     (*engine).should_block(str_from(url, url_len), str_from(source, source_len), kind)
 }
+
+// Returns ptr << 32 | len of a buffer the caller frees with dealloc(ptr, len).
+#[no_mangle]
+pub unsafe extern "C" fn cosmetic_css(engine: *const Engine, url: *const u8, url_len: usize) -> u64 {
+    let css = (*engine).cosmetic_css(str_from(url, url_len)).into_bytes().into_boxed_slice();
+    let len = css.len();
+    ((Box::into_raw(css) as *mut u8 as u64) << 32) | len as u64
+}

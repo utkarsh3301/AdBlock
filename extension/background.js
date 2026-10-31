@@ -17,6 +17,7 @@ const TYPES = {
 };
 
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 let wasm, engine;
 
 function pass(str) {
@@ -24,6 +25,14 @@ function pass(str) {
   const ptr = wasm.alloc(bytes.length);
   new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);
   return [ptr, bytes.length];
+}
+
+function take(packed) {
+  const ptr = Number(packed >> 32n);
+  const len = Number(packed & 0xffffffffn);
+  const str = decoder.decode(new Uint8Array(wasm.memory.buffer, ptr, len));
+  wasm.dealloc(ptr, len);
+  return str;
 }
 
 // ponytail: list is fetched on every startup and requests before it loads pass through; cache it in storage if that matters
@@ -51,5 +60,18 @@ browser.webRequest.onBeforeRequest.addListener(
   { urls: ["<all_urls>"] },
   ["blocking"],
 );
+
+// ponytail: every frame gets the full ~520 KB generic stylesheet; match generic selectors against the page's
+// classes and ids instead if pages feel slower
+browser.webNavigation.onCommitted.addListener(({ tabId, frameId, url }) => {
+  if (!engine || !url.startsWith("http")) return;
+  const [ptr, len] = pass(url);
+  const css = take(wasm.cosmetic_css(engine, ptr, len));
+  wasm.dealloc(ptr, len);
+  if (!css) return;
+  browser.tabs
+    .insertCSS(tabId, { code: css, frameId, cssOrigin: "user", runAt: "document_start" })
+    .catch(() => {});
+});
 
 init();

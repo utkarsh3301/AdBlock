@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[cfg(target_arch = "wasm32")]
 mod wasm;
@@ -117,7 +117,7 @@ impl Filter {
         if line.is_empty()
             || line.starts_with('!')
             || line.starts_with('[')
-            || ["##", "#@#", "#?#", "#$#", "#%#"].iter().any(|m| line.contains(m))
+            || ["##", "#@", "#?#", "#$#", "#%#"].iter().any(|m| line.contains(m))
         {
             return None;
         }
@@ -273,23 +273,116 @@ impl Index {
     }
 }
 
+struct Cosmetic {
+    selector: String,
+    domains: Vec<String>,
+    not_domains: Vec<String>,
+}
+
+impl Cosmetic {
+    // Returns (is_exception, rule) for "domains##selector" and "domains#@#selector".
+    fn parse(line: &str) -> Option<(bool, Self)> {
+        let line = line.trim();
+        let (i, exception, marker) = match line.find("#@#") {
+            Some(i) => (i, true, 3),
+            None => (line.find("##")?, false, 2),
+        };
+        let selector = &line[i + marker..];
+        // ponytail: scriptlets (+js) and HTML filters (^) are skipped until scriptlet injection exists
+        if selector.is_empty() || selector.starts_with(['+', '^']) || selector.contains(['{', '}']) {
+            return None;
+        }
+        let (mut domains, mut not_domains) = (vec![], vec![]);
+        for d in line[..i].split(',').filter(|d| !d.is_empty()) {
+            match d.strip_prefix('~') {
+                Some(d) => not_domains.push(d.to_ascii_lowercase()),
+                None => domains.push(d.to_ascii_lowercase()),
+            }
+        }
+        Some((exception, Self { selector: selector.to_string(), domains, not_domains }))
+    }
+
+    fn is_generic(&self) -> bool {
+        self.domains.is_empty() && self.not_domains.is_empty()
+    }
+
+    fn applies(&self, host: &str) -> bool {
+        (self.domains.is_empty() || self.domains.iter().any(|d| domain_matches(host, d)))
+            && !self.not_domains.iter().any(|d| domain_matches(host, d))
+    }
+}
+
+// One rule per selector, so a selector the browser rejects only drops itself.
+fn hide_css<'a>(selectors: impl Iterator<Item = &'a str>) -> String {
+    selectors.map(|s| format!("{s}{{display:none!important}}\n")).collect()
+}
+
 pub struct Engine {
     important: Index,
     blocks: Index,
     exceptions: Index,
+    generic: Vec<String>,
+    generic_css: String,
+    // ponytail: linear scan of domain-specific rules per page; index by hostname if it shows up in profiles
+    specific: Vec<Cosmetic>,
+    unhide: Vec<Cosmetic>,
 }
 
 impl Engine {
     pub fn new(rules: &str) -> Self {
         let (mut important, mut blocks, mut exceptions) = (vec![], vec![], vec![]);
-        for f in rules.lines().filter_map(Filter::parse) {
-            match (f.exception, f.important) {
-                (true, _) => exceptions.push(f),
-                (false, true) => important.push(f),
-                (false, false) => blocks.push(f),
+        let (mut hide, mut unhide) = (vec![], vec![]);
+        for line in rules.lines() {
+            if let Some((exception, rule)) = Cosmetic::parse(line) {
+                if exception {
+                    unhide.push(rule);
+                } else {
+                    hide.push(rule);
+                }
+            } else if let Some(f) = Filter::parse(line) {
+                match (f.exception, f.important) {
+                    (true, _) => exceptions.push(f),
+                    (false, true) => important.push(f),
+                    (false, false) => blocks.push(f),
+                }
             }
         }
-        Self { important: Index::new(important), blocks: Index::new(blocks), exceptions: Index::new(exceptions) }
+
+        // Exceptions without domains switch a selector off everywhere, so drop it up front.
+        let (global, unhide): (Vec<_>, Vec<_>) = unhide.into_iter().partition(Cosmetic::is_generic);
+        let global: HashSet<String> = global.into_iter().map(|r| r.selector).collect();
+        let (generic, specific): (Vec<_>, Vec<_>) =
+            hide.into_iter().filter(|r| !global.contains(&r.selector)).partition(Cosmetic::is_generic);
+        let generic: Vec<String> = generic.into_iter().map(|r| r.selector).collect();
+
+        Self {
+            important: Index::new(important),
+            blocks: Index::new(blocks),
+            exceptions: Index::new(exceptions),
+            generic_css: hide_css(generic.iter().map(String::as_str)),
+            generic,
+            specific,
+            unhide,
+        }
+    }
+
+    pub fn cosmetic_css(&self, page_url: &str) -> String {
+        let (s, e) = host_range(page_url);
+        let host = page_url[s..e].to_ascii_lowercase();
+        let unhidden: HashSet<&str> =
+            self.unhide.iter().filter(|r| r.applies(&host)).map(|r| r.selector.as_str()).collect();
+        let mut css = if unhidden.is_empty() {
+            self.generic_css.clone()
+        } else {
+            hide_css(self.generic.iter().map(String::as_str).filter(|s| !unhidden.contains(s)))
+        };
+        css += &hide_css(
+            self.specific
+                .iter()
+                .filter(|r| r.applies(&host) && !unhidden.contains(r.selector.as_str()))
+                .map(|r| r.selector.as_str()),
+        );
+        css
     }
 
     pub fn filter_count(&self) -> usize {
@@ -352,5 +445,33 @@ example.com##.ad
         assert!(!b("https://bad.com/", "https://a.com/", Script));
         assert!(!b("https://example.com/", "https://a.com/", Document));
         assert!(!b("https://ads.example.com/", "https://ads.example.com/", Document));
+    }
+
+    #[test]
+    fn cosmetic_filters() {
+        let e = Engine::new(
+            "
+##.ad-banner
+##.sponsored
+news.com##.promo
+news.com,~shop.news.com##.native
+#@#.sponsored
+blog.com#@#.ad-banner
+example.com##+js(json-prune, adPlacements)
+example.com#?#.x:-abp-has(.ad)
+example.com##a{color:red}
+",
+        );
+        let css = |u| e.cosmetic_css(u);
+
+        let other = css("https://www.cnn.com/");
+        assert!(other.contains(".ad-banner{display:none!important}"));
+        assert!(!other.contains(".sponsored") && !other.contains(".promo"));
+        assert!(css("https://www.news.com/").contains(".promo{") && css("https://news.com/").contains(".native{"));
+        assert!(css("https://shop.news.com/").contains(".promo{") && !css("https://shop.news.com/").contains(".native"));
+        assert!(!css("https://blog.com/").contains(".ad-banner"));
+        let ex = css("https://example.com/");
+        assert!(!ex.contains("json-prune") && !ex.contains("abp-has") && !ex.contains("color"));
+        assert!(!e.should_block("https://example.com/x", "https://a.com/", Script));
     }
 }
