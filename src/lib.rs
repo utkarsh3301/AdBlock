@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 
+#[cfg(target_arch = "wasm32")]
+mod wasm;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RequestType {
     Document,
@@ -170,7 +173,9 @@ impl Filter {
                 }
             }
         }
-        f.types = (if include != 0 { include } else { ALL_TYPES }) & !exclude;
+        // Top-level pages are only blocked by an explicit $document, as in Adblock Plus.
+        let default = ALL_TYPES & !RequestType::Document.bit();
+        f.types = (if include != 0 { include } else { default }) & !exclude;
 
         if let Some(p) = pattern.strip_prefix("||") {
             f.host_anchor = true;
@@ -346,5 +351,6 @@ example.com##.ad
         assert!(b("https://evil.com/", "https://a.com/", Script));
         assert!(!b("https://bad.com/", "https://a.com/", Script));
         assert!(!b("https://example.com/", "https://a.com/", Document));
+        assert!(!b("https://ads.example.com/", "https://ads.example.com/", Document));
     }
 }
