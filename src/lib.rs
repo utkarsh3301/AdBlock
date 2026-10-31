@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RequestType {
     Document,
@@ -190,6 +192,17 @@ impl Filter {
         Some(f)
     }
 
+    // Tokens that must appear whole in any URL this filter matches: not touching a '*' and not cut off
+    // by an unanchored pattern end.
+    fn tokens(&self) -> impl Iterator<Item = u64> + '_ {
+        let p = self.pattern.as_bytes();
+        token_spans(p)
+            .filter(move |&(s, e)| {
+                (s == 0 || p[s - 1] != b'*') && if e == p.len() { self.end_anchor } else { p[e] != b'*' }
+            })
+            .map(move |(s, e)| hash(&p[s..e]))
+    }
+
     fn matches(&self, req: &Request) -> bool {
         if self.types & req.kind.bit() == 0
             || self.third_party.is_some_and(|tp| tp != req.third_party)
@@ -210,30 +223,82 @@ impl Filter {
     }
 }
 
+fn token_spans(s: &[u8]) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while i < s.len() && !s[i].is_ascii_alphanumeric() {
+            i += 1;
+        }
+        let start = i;
+        while i < s.len() && s[i].is_ascii_alphanumeric() {
+            i += 1;
+        }
+        (start < i).then_some((start, i))
+    })
+}
+
+fn hash(token: &[u8]) -> u64 {
+    token
+        .iter()
+        .fold(0xcbf29ce484222325, |h, &c| (h ^ c.to_ascii_lowercase() as u64).wrapping_mul(0x100000001b3))
+}
+
+// Filters are bucketed under their rarest token. A request only checks the buckets for tokens in its
+// URL, plus bucket 0 for filters with no usable token.
+struct Index {
+    buckets: HashMap<u64, Vec<Filter>>,
+}
+
+impl Index {
+    fn new(filters: Vec<Filter>) -> Self {
+        let mut counts: HashMap<u64, usize> = HashMap::new();
+        for t in filters.iter().flat_map(Filter::tokens) {
+            *counts.entry(t).or_default() += 1;
+        }
+        let mut buckets: HashMap<u64, Vec<Filter>> = HashMap::new();
+        for f in filters {
+            let key = f.tokens().min_by_key(|t| counts[t]).unwrap_or(0);
+            buckets.entry(key).or_default().push(f);
+        }
+        Self { buckets }
+    }
+
+    fn any(&self, tokens: &[u64], req: &Request) -> bool {
+        tokens.iter().chain(&[0]).filter_map(|t| self.buckets.get(t)).flatten().any(|f| f.matches(req))
+    }
+}
+
 pub struct Engine {
-    filters: Vec<Filter>,
+    important: Index,
+    blocks: Index,
+    exceptions: Index,
 }
 
 impl Engine {
     pub fn new(rules: &str) -> Self {
-        Self { filters: rules.lines().filter_map(Filter::parse).collect() }
-    }
-
-    // ponytail: linear scan of every filter per request; add a token index before loading full EasyList
-    pub fn should_block(&self, url: &str, source_url: &str, kind: RequestType) -> bool {
-        let req = Request::new(url, source_url, kind);
-        let (mut blocked, mut excepted) = (false, false);
-        for f in self.filters.iter().filter(|f| f.matches(&req)) {
-            if f.important && !f.exception {
-                return true;
-            }
-            if f.exception {
-                excepted = true;
-            } else {
-                blocked = true;
+        let (mut important, mut blocks, mut exceptions) = (vec![], vec![], vec![]);
+        for f in rules.lines().filter_map(Filter::parse) {
+            match (f.exception, f.important) {
+                (true, _) => exceptions.push(f),
+                (false, true) => important.push(f),
+                (false, false) => blocks.push(f),
             }
         }
-        blocked && !excepted
+        Self { important: Index::new(important), blocks: Index::new(blocks), exceptions: Index::new(exceptions) }
+    }
+
+    pub fn filter_count(&self) -> usize {
+        [&self.important, &self.blocks, &self.exceptions].iter().flat_map(|i| i.buckets.values()).map(Vec::len).sum()
+    }
+
+    pub fn should_block(&self, url: &str, source_url: &str, kind: RequestType) -> bool {
+        let req = Request::new(url, source_url, kind);
+        let url = req.url_lower.as_bytes();
+        let mut tokens: Vec<u64> = token_spans(url).map(|(s, e)| hash(&url[s..e])).collect();
+        tokens.sort_unstable();
+        tokens.dedup();
+        self.important.any(&tokens, &req)
+            || (self.blocks.any(&tokens, &req) && !self.exceptions.any(&tokens, &req))
     }
 }
 
